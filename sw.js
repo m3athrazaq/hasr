@@ -1,6 +1,6 @@
 // Hasr service worker: offline app shell, cached AI models/runtime, and the cross-origin
 // isolation headers (COOP/COEP) that GitHub Pages cannot send, so the AI engine can use all CPU cores.
-const VERSION = 'hasr-1.0.1';
+const VERSION = 'hasr-1.0.2';
 const SHELL_CACHE = 'hasr-shell-' + VERSION;
 const ASSET_CACHE = 'hasr-assets-v1'; // models and runtime: large, versioned by file name
 const SHELL = [
@@ -15,7 +15,8 @@ const SHELL = [
 const BIG = /\/(models\/[^/]+|vendor\/ort\/[^/]+)$/;
 
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(SHELL_CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  // bypass the browser's HTTP cache so a new version never installs yesterday's files
+  e.waitUntil(caches.open(SHELL_CACHE).then((c) => c.addAll(SHELL.map((u) => new Request(u, { cache: 'reload' })))).then(() => self.skipWaiting()));
 });
 
 self.addEventListener('activate', (e) => {
@@ -45,7 +46,7 @@ self.addEventListener('fetch', (e) => {
     // network first so updates arrive, cached shell when offline
     e.respondWith((async () => {
       try {
-        const res = await fetch(req);
+        const res = await fetch(req, { cache: 'no-cache' });
         if (res.ok) { const c = await caches.open(SHELL_CACHE); c.put('index.html', res.clone()); }
         return isolate(res);
       } catch {
@@ -73,7 +74,7 @@ self.addEventListener('fetch', (e) => {
   e.respondWith((async () => {
     const c = await caches.open(SHELL_CACHE);
     const hit = await c.match(req, { ignoreSearch: true });
-    const net = fetch(req).then((res) => { if (res.ok) c.put(req, res.clone()); return res; }).catch(() => null);
+    const net = fetch(req, { cache: 'no-cache' }).then((res) => { if (res.ok) c.put(req, res.clone()); return res; }).catch(() => null);
     if (hit) { e.waitUntil(net); return isolate(hit); }
     const res = await net;
     return res ? isolate(res) : new Response('offline', { status: 503 });
