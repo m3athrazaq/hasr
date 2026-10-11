@@ -9,7 +9,7 @@ import { Session } from './session.js';
 import { summarize, toCSV, toJSON, textSummary, batchTime, fileName } from './report.js';
 import { renderGuide } from './guide.js';
 
-export const VERSION = '1.0.0';
+export const VERSION = '1.0.1';
 const $ = (id) => document.getElementById(id);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const settings = loadSettings();

@@ -15,10 +15,19 @@ let ortPromise = null;
 let backendUsed = null;
 let lock = Promise.resolve();
 
+const withTimeout = (p, ms) => Promise.race([p, new Promise((resolve) => setTimeout(() => resolve(null), ms))]);
+const TRIAL_KEY = 'hasr.gpuTrial';
+const trial = {
+  get() { try { return localStorage.getItem(TRIAL_KEY); } catch { return null; } },
+  set(v) { try { localStorage.setItem(TRIAL_KEY, v); } catch { /* storage may be unavailable */ } },
+};
+
 async function gpuUsable() {
   try {
     if (!('gpu' in navigator)) return false;
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    // a previous start on the graphics card never finished (hang or crash): stay on the processor
+    if (trial.get() === 'pending' || trial.get() === 'slow') return false;
+    const adapter = await withTimeout(navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }), 4000);
     if (!adapter) return false;
     // a software (fallback) adapter is far slower than WASM on the CPU
     if (adapter.isFallbackAdapter || adapter.info?.isFallbackAdapter) return false;
@@ -71,7 +80,11 @@ export async function loadRuntime(pref = 'auto', onProgress) {
     const ort = await import(useGpu ? '../vendor/ort/ort.webgpu.bundle.min.mjs' : '../vendor/ort/ort.wasm.bundle.min.mjs');
     ort.env.wasm.wasmBinary = await fetchAsset(useGpu ? 'vendor/ort/ort-wasm-simd-threaded.asyncify.wasm' : 'vendor/ort/ort-wasm-simd-threaded.wasm', onProgress);
     const cores = navigator.hardwareConcurrency || 2;
-    ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.max(1, Math.min(4, cores - 1)) : 1;
+    const wanted = self.crossOriginIsolated ? Math.max(1, Math.min(4, cores - 1)) : 1;
+    // on the graphics card the CPU threads only add contention; on the processor use several cores
+    ort.env.wasm.numThreads = self.__ortThreads ?? (useGpu ? 1 : wanted);
+    // on the processor, run the engine in its own worker so the screen stays responsive
+    if (!useGpu && self.__ortProxy !== false) ort.env.wasm.proxy = true;
     ort.env.logLevel = 'error';
     backendUsed = useGpu ? 'webgpu' : 'wasm';
     return ort;
@@ -91,6 +104,7 @@ export class Detector {
     const ort = await loadRuntime(backend, onProgress ? (p) => onProgress(p, 'runtime') : null);
     const bytes = await fetchAsset(info.file, onProgress ? (p) => onProgress(p, 'model') : null);
     const eps = backendUsed === 'webgpu' ? ['webgpu', 'wasm'] : ['wasm'];
+    if (backendUsed === 'webgpu') trial.set('pending');
     let session;
     try {
       session = await ort.InferenceSession.create(bytes, { executionProviders: eps, graphOptimizationLevel: 'all' });
@@ -111,9 +125,21 @@ export class Detector {
     d.input = new Float32Array(3 * info.size * info.size);
     d.busy = false;
     // warm-up run so the first real frame is not slow (shader compilation on WebGPU)
-    const warm = lock.then(() => d.session.run({ [d.inputName]: new ort.Tensor('float32', d.input, [1, 3, d.size, d.size]) }));
+    const warm = lock.then(() => d.session.run({ [d.inputName]: new ort.Tensor('float32', new Float32Array(d.input.length), [1, 3, d.size, d.size]) }));
     lock = warm.catch(() => {});
     await warm;
+    if (backendUsed === 'webgpu') {
+      // time a few runs: a weak graphics card can be slower than the processor
+      const t0 = performance.now();
+      for (let i = 0; i < 3; i++) {
+        const r = lock.then(() => d.session.run({ [d.inputName]: new ort.Tensor('float32', new Float32Array(d.input.length), [1, 3, d.size, d.size]) }));
+        lock = r.catch(() => {});
+        await r;
+      }
+      const per = (performance.now() - t0) / 3;
+      d.gpuMs = per;
+      trial.set(per > 300 ? 'slow' : 'ok');
+    }
     return d;
   }
 
@@ -139,6 +165,8 @@ export class Detector {
     ctx.imageSmoothingQuality = 'medium';
     ctx.drawImage(source, r0.x, r0.y, r0.w, r0.h, px, py, nw, nh);
     const pix = ctx.getImageData(0, 0, S, S).data;
+    // with the engine in a worker the buffer is handed over (detached), so it cannot be reused
+    if (this.ort.env.wasm.proxy || this.input.length === 0) this.input = new Float32Array(3 * S * S);
     const inp = this.input;
     const plane = S * S;
     for (let i = 0, j = 0; i < plane; i++, j += 4) {
