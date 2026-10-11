@@ -9,10 +9,13 @@ export const COUNTER_DEFAULTS = {
   segMargin: 0.1,      // crossings may happen this far beyond the drawn segment ends (fraction of its length)
   nearBySize: 1.2,     // "near the line" distance for orphan analysis, in sheep lengths
   orphanWindow: 2.5,   // seconds to look for an explanation of an orphan birth/death
-  oversize: 1.6,       // box area above this multiple of a typical sheep is flagged "maybe 2 sheep"
+  oversize: 1.6,       // box area above this multiple of a typical sheep, with two animals seen inside it, is flagged "maybe 2 sheep"
+  oversizeAlone: 2.2,  // ... or above this multiple even without that evidence
   lowConf: 0.32,       // crossings by tracks never above this score are flagged
   relinkFlagGap: 0.7,  // re-linked crossings after a gap longer than this (s) are flagged
   minSizeSamples: 20,
+  warmup: 1.0,         // seconds after a (re)start in which animals already past the line are not "appearing"
+  birthSide: 0.15,     // a track first seen this far into the dead band (fraction of it) starts on that side
 };
 
 const median = (arr) => {
@@ -40,6 +43,9 @@ export class LineCounter {
     this._geomCache = null;
   }
 
+  // tracking restarted (pause, stall): what is visible next was not "born" there
+  restart() { this.st.clear(); this.births = []; this.deaths = []; this.startT = null; }
+
   setLine(line, dir = 1) { this.line = { ...line }; this.dir = dir >= 0 ? 1 : -1; this._geomCache = null; }
   setFrame(W, H) { if (W !== this.W || H !== this.H) { this.W = W; this.H = H; this._geomCache = null; } }
 
@@ -60,6 +66,9 @@ export class LineCounter {
     const dx = px - g.p1x, dy = py - g.p1y;
     return { d: dx * g.nx + dy * g.ny, s: (dx * g.ux + dy * g.uy) / g.L };
   }
+
+  // unit vector (px) pointing to the destination side: the way counted animals walk
+  forward() { const g = this._geom(); return [g.nx, g.ny]; }
 
   sheepLen() { return this.lens.length >= this.o.minSizeSamples ? median(this.lens) : 0; }
   sheepArea() { return this.sizes.length >= this.o.minSizeSamples ? median(this.sizes) : 0; }
@@ -82,6 +91,7 @@ export class LineCounter {
   update(tracks, tevents, t) {
     const out = [];
     const near = this.nearPx();
+    if (this.startT == null) this.startT = t;
 
     for (const ev of tevents) {
       if (ev.type === 'relink') {
@@ -111,8 +121,12 @@ export class LineCounter {
         const h0 = tr.hist[0];
         const g0 = h0 ? this.locate(h0.cx, h0.cy) : { d, s };
         st = { side: 0, born: h0 ? h0.t : t, bornD: g0.d, bornS: g0.s, crossed: 0, lastD: g0.d, lastS: g0.s, lastZone: 0, relinkGap: 0, maxScore: 0 };
+        // first seen inside the dead band but clearly on one side: start from that side, so a sheep
+        // that first shows up just before the line and walks over it is still counted - unless it may
+        // be an already counted sheep picked up again (a counted track was lost right there)
+        if (Math.abs(g0.d) >= this.o.birthSide * this.bandPx() && this.inSeg(g0.s) && !this._recounted(tr, h0, tracks, t)) st.side = g0.d < 0 ? -1 : 1;
         this.st.set(tr.id, st);
-        if (Math.abs(g0.d) < near && this.inSeg(g0.s)) {
+        if (Math.abs(g0.d) < near && this.inSeg(g0.s) && st.born - this.startT >= this.o.warmup) {
           this.births.push({ id: tr.id, t: st.born, side: g0.d < 0 ? -1 : 1, d: g0.d, s: g0.s, box: tr.box, decideAt: t + this.o.orphanWindow });
         }
         for (let i = 0; i < tr.hist.length - 1; i++) {
@@ -152,6 +166,26 @@ export class LineCounter {
     return out;
   }
 
+  _recounted(tr, h0, tracks, t) {
+    if (!h0) return false;
+    const len = this.sheepLen() || 0.12 * Math.min(this.W, this.H);
+    // the new track starts where a counted, now lost, sheep was (or a little ahead of it, never well behind)
+    const same = (b, vel, reach = 1) => {
+      const [x, y] = center(b);
+      const dx = h0.cx - x, dy = h0.cy - y;
+      if (Math.hypot(dx, dy) >= reach * len) return false;
+      const sp = Math.hypot(vel?.[0] || 0, vel?.[1] || 0);
+      return sp < 1e-3 || (dx * vel[0] + dy * vel[1]) / sp / len > -0.35;
+    };
+    for (const o of tracks) {
+      if (o === tr || o.state !== 'lost') continue;
+      const so = this.st.get(o.id);
+      if (so && so.crossed && same(o.box, o.velocity())) return true;
+    }
+    // a track given up on a moment ago: only if the new one starts right where it was
+    return this.deaths.some((d) => d.crossed && t - d.t < 1.6 && same(d.box, d.vel, 0.6));
+  }
+
   _cross(tr, st, dir, t) {
     st.crossed += dir;
     this.auto += dir;
@@ -161,7 +195,10 @@ export class LineCounter {
     if (dir > 0 && typical) {
       const recent = tr.hist.slice(-6).map((h) => h.a);
       const ratio = median(recent) / typical;
-      if (ratio >= this.o.oversize) flags.push({ type: 'merge', suggest: Math.max(1, Math.round(ratio) - 1), ratio });
+      // big sheep and sheep turning sideways are common: a large box alone is weak evidence
+      if ((ratio >= this.o.oversize && (tr.split || 0) >= 1) || ratio >= this.o.oversizeAlone) {
+        flags.push({ type: 'merge', suggest: Math.max(1, Math.round(ratio) - 1), ratio, split: tr.split || 0 });
+      }
     }
     if (st.maxScore < this.o.lowConf) flags.push({ type: 'lowconf', suggest: -dir });
     if (st.relinkGap > this.o.relinkFlagGap) flags.push({ type: 'relink', suggest: 0, gap: st.relinkGap });

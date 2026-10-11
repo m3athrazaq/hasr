@@ -10,6 +10,7 @@ const tracker = new Tracker({ fps: 15, ...(opts.t || {}) });
 const counter = new LineCounter(opts.c || {});
 counter.setFrame(D.W, D.H);
 counter.setLine({ x1, y1, x2, y2 }, Number(dirStr || 1));
+if (!opts.noFlow) tracker.setFlow(...counter.forward());
 const frames = [], events = [];
 for (const f of D.frames) {
   const { tracks, events: tev } = tracker.step(f.boxes, f.t);

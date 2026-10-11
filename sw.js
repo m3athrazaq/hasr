@@ -1,13 +1,13 @@
 // Hasr service worker: offline app shell, cached AI models/runtime, and the cross-origin
 // isolation headers (COOP/COEP) that GitHub Pages cannot send, so the AI engine can use all CPU cores.
-const VERSION = 'hasr-1.0.2';
+const VERSION = 'hasr-1.0.3';
 const SHELL_CACHE = 'hasr-shell-' + VERSION;
 const ASSET_CACHE = 'hasr-assets-v1'; // models and runtime: large, versioned by file name
 const SHELL = [
   './', 'index.html', 'manifest.webmanifest', 'files.json', 'css/app.css',
   'js/app.js', 'js/i18n.js', 'js/store.js', 'js/sources.js', 'js/detector.js', 'js/overlay.js', 'js/pipeline.js',
   'js/session.js', 'js/report.js', 'js/guide.js',
-  'js/engine/tracker.js', 'js/engine/counter.js', 'js/engine/kalman.js', 'js/engine/hungarian.js',
+  'js/engine/tracker.js', 'js/engine/counter.js', 'js/engine/kalman.js', 'js/engine/hungarian.js', 'js/engine/flow.js',
   'fonts/readex-pro-arabic-400-normal.woff2', 'fonts/readex-pro-arabic-500-normal.woff2', 'fonts/readex-pro-arabic-700-normal.woff2',
   'fonts/readex-pro-latin-400-normal.woff2', 'fonts/readex-pro-latin-500-normal.woff2', 'fonts/readex-pro-latin-700-normal.woff2',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/icon-180.png',

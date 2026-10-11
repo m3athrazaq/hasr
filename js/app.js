@@ -5,11 +5,13 @@ import { openCamera, openScreen, openFile, listCameras, canCaptureScreen } from 
 import { Detector, MODELS, runtimeInfo } from './detector.js';
 import { Overlay } from './overlay.js';
 import { Pipeline, sheepEvidence } from './pipeline.js';
+import { FlowLearner } from './engine/flow.js';
+import { Tracker } from './engine/tracker.js';
 import { Session } from './session.js';
 import { summarize, toCSV, toJSON, textSummary, batchTime, fileName } from './report.js';
 import { renderGuide } from './guide.js';
 
-export const VERSION = '1.0.2';
+export const VERSION = '1.0.3';
 const $ = (id) => document.getElementById(id);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const settings = loadSettings();
@@ -227,8 +229,9 @@ async function enterSetup(resumeDoc = null) {
   // geometry: resume > preset for this source > sensible default
   const key = presetKey();
   const pre = resumeDoc ? resumeDoc.config : settings.presets[key];
-  if (pre && pre.line) { S.line = pre.line; S.dir = pre.dir || 1; S.roi = pre.roi || null; S.userFlipped = true; }
-  else { S.line = { x1: 0.5, y1: 0.08, x2: 0.5, y2: 0.92 }; S.dir = 1; S.roi = null; S.userFlipped = false; }
+  if (pre && pre.line) { S.line = pre.line; S.dir = pre.dir || 1; S.roi = pre.roi || null; S.userFlipped = true; S.lineByUser = true; }
+  else { S.line = { x1: 0.5, y1: 0.08, x2: 0.5, y2: 0.92 }; S.dir = 1; S.roi = null; S.userFlipped = false; S.lineByUser = false; }
+  S.autoLined = false;
   S.overlay.line = S.line; S.overlay.dir = S.dir; S.overlay.roi = S.roi;
   $('btnRoiClear').hidden = !S.roi;
   S.overlay.resize();
@@ -250,8 +253,49 @@ async function enterSetup(resumeDoc = null) {
   $('btnStart').disabled = false;
   S.resumeDoc = resumeDoc;
   startPreview();
+  if (!S.lineByUser) toast(t('autoLineHint'), 5000);
   // first guess with the current line; drawing a new line repeats the choice
   if (S.modelAuto) autoPickModel();
+  else if (!S.source.live && !S.lineByUser) autoLineFromFile();
+}
+
+// recorded video: look at a few seconds, see which way the sheep walk, draw the line across
+async function autoLineFromFile() {
+  const src = S.source;
+  const d = S.detectors[S.modelKey];
+  if (!src || src.live || !d || S.lineByUser) return;
+  const v = src.video, vw = src.width, vh = src.height;
+  const tracker = new Tracker({ fps: 15 });
+  const flow = new FlowLearner();
+  const dur = src.duration || 0;
+  modelState(t('autoLineLooking'));
+  for (const start of [0.15, 0.45, 0.7]) {
+    tracker.reset();
+    const t0 = Math.max(0, Math.min(dur - 4.5, dur * start));
+    for (let i = 0; i < 32; i++) {
+      const tt = t0 + i / 8;
+      if (tt >= dur || S.source !== src || S.lineByUser) break;
+      await seek(v, tt);
+      const r = await d.detect(v, vw, vh, null, 0.1);
+      const { tracks } = tracker.step(r.boxes, tt);
+      flow.add(tracks, vw, vh);
+    }
+    const sug = flow.suggest();
+    if (sug) { applyAutoLine(sug); break; }
+  }
+  if (!S.autoLined && S.source === src) modelState(t('autoLineFailed'), 'bad');
+  else if (S.source === src) modelState(`${t('modelReady')}: ${modelName(S.modelKey)}`, 'ok');
+  await seek(v, Math.min(5, dur * 0.1));
+  previewFileFrame();
+}
+
+function applyAutoLine(sug) {
+  S.autoLined = true;
+  S.line = sug.line; S.dir = sug.dir;
+  S.overlay.line = { ...sug.line }; S.overlay.dir = sug.dir;
+  S.overlay.draw();
+  S.pipeline?.setGeometry(S.line, S.dir, S.roi);
+  toast(t('autoLineDone'), 4000);
 }
 
 function presetKey() {
@@ -284,31 +328,37 @@ async function useModel(key) {
   const d = await getDetector(key);
   S.modelKey = key;
   if (S.pipeline) S.pipeline.setDetector(d);
-  const names = { 'sheep-top': t('viewTop'), 'general-n': t('viewSide'), 'general-s': t('viewSideHq') };
-  modelState(`${t('modelReady')}: ${names[key]}${S.modelAuto ? ' · ' + t('picked') : ''}`, 'ok');
+  modelState(`${t('modelReady')}: ${modelName(key)}${S.modelAuto ? ' · ' + t('picked') : ''}`, 'ok');
   return d;
 }
 
+function modelName(key) {
+  return { 'sheep-race': t('viewRace'), 'sheep-top': t('viewTop'), 'general-n': t('viewSide'), 'general-s': t('viewSideHq') }[key] || key;
+}
+
 async function autoPickModel() {
-  // compare the overhead and the angled model on live frames until one clearly sees more sheep
+  // try the general, the overhead and the race model on frames until one clearly sees more sheep
   const runId = (S.autoRun = (S.autoRun || 0) + 1);
   modelState(t('pickingModel'));
   $('btnStart').disabled = true;
   S.picking = true;
-  let top, side;
-  try { top = await getDetector('sheep-top'); side = await getDetector('general-n'); } catch { $('btnStart').disabled = false; S.picking = false; return; }
-  let sTop = 0, sSide = 0, rounds = 0, warned = false;
+  const keys = ['general-n', 'sheep-top', 'sheep-race'];
+  const dets = {};
+  try { for (const k of keys) dets[k] = await getDetector(k); } catch { $('btnStart').disabled = false; S.picking = false; return; }
+  const sc = Object.fromEntries(keys.map((k) => [k, 0]));
+  let rounds = 0, warned = false;
   while (S.autoRun === runId && $('scr-live').dataset.mode === 'setup' && S.source) {
-    const a = await sheepEvidence(top, S.source, S.roi, S.line);
-    const b = await sheepEvidence(side, S.source, S.roi, S.line);
-    sTop += a.score; sSide += b.score; rounds++;
-    const hi = Math.max(sTop, sSide), lo = Math.min(sTop, sSide);
-    if (hi >= 2.5 && hi >= 1.5 * lo) break;
-    if (rounds >= 4 && hi < 0.8) {
+    for (const k of keys) sc[k] += (await sheepEvidence(dets[k], S.source, S.roi, S.line)).score;
+    rounds++;
+    const [k1, k2] = keys.slice().sort((a, b) => sc[b] - sc[a]);
+    if (sc[k1] >= 2.5 && sc[k1] >= 1.5 * sc[k2]) break;
+    // both specialised models clearly beat the general one: either will do, take the stronger
+    if (rounds >= 6 && sc[k1] >= 2.5 && k1 !== 'general-n' && k2 !== 'general-n' && sc[k2] >= 1.5 * sc['general-n']) break;
+    if (rounds >= 4 && sc[k1] < 0.8) {
       if (!warned) { modelState(t('noSheepYet')); warned = true; }
-      sTop *= 0.5; sSide *= 0.5;
+      for (const k of keys) sc[k] *= 0.5;
     }
-    if (rounds >= 14 && hi >= 1) break;
+    if (rounds >= 14 && sc[k1] >= 1) break;
     await sleep(S.source.live ? 700 : 50);
     if (!S.source.live && S.source.video) {
       // recorded video: look at a few moments of the recording
@@ -316,12 +366,17 @@ async function autoPickModel() {
     }
   }
   if (S.autoRun !== runId || $('scr-live').dataset.mode !== 'setup') return;
-  // the overhead model must clearly win: it also fires on far-away or partial animals
-  const pick = sTop > 1.5 * sSide ? 'sheep-top' : 'general-n';
+  // a specialised model must clearly win: they also fire on far-away or partial animals
+  let pick = 'general-n';
+  for (const k of ['sheep-top', 'sheep-race']) if (sc[k] > 1.5 * sc['general-n'] && (pick === 'general-n' || sc[k] > sc[pick])) pick = k;
+  S.pickScores = sc;
   await useModel(pick);
   S.picking = false;
   $('btnStart').disabled = false;
-  if (S.source && !S.source.live) previewFileFrame();
+  if (S.source && !S.source.live) {
+    if (!S.lineByUser && !S.autoLined) await autoLineFromFile();
+    else previewFileFrame();
+  }
 }
 
 function startPreview() {
@@ -332,7 +387,10 @@ function startPreview() {
       $('setupSeen').textContent = String(u.visible);
       $('setupFps').textContent = u.fps ? u.fps.toFixed(1) : '–';
       setQ($('setupQ'), u.quality);
-      if (!S.userFlipped) {
+      if (!S.lineByUser && !S.autoLined) {
+        const sug = p.flow.suggest();
+        if (sug) { applyAutoLine(sug); if (S.modelAuto) autoPickModel(); }
+      } else if (!S.userFlipped && !S.autoLined) {
         const md = p.motionDirection();
         if (md && md !== S.dir) { S.dir = md; S.overlay.dir = md; p.setGeometry(S.line, S.dir, S.roi); }
       }
@@ -358,6 +416,7 @@ async function previewFileFrame() {
 
 function onGeometryChange() {
   const changed = JSON.stringify(S.line) !== JSON.stringify(S.overlay.line);
+  if (changed) S.lineByUser = true;
   S.line = S.overlay.line;
   S.roi = S.overlay.roi;
   if (changed && !S.userFlipped) { S.dir = 1; S.overlay.dir = 1; S.overlay.draw(); }
@@ -380,6 +439,11 @@ $('btnFlip').onclick = () => {
   S.pipeline?.setGeometry(S.line, S.dir, S.roi);
 };
 $('btnToolLine').onclick = () => { S.overlay.tool = 'line'; setToolButtons(); toast(t('step2')); };
+$('btnAutoLine').onclick = () => {
+  S.lineByUser = false; S.autoLined = false; S.userFlipped = false;
+  S.pipeline?.flow.reset();
+  if (S.source && !S.source.live) autoLineFromFile(); else toast(t('autoLineHint'), 5000);
+};
 $('btnToolRoi').onclick = () => { S.overlay.tool = 'roi'; setToolButtons(); toast(t('roiOn')); };
 $('btnRoiClear').onclick = () => { S.overlay.roi = null; onGeometryChange(); S.overlay.draw(); };
 $('selView').onchange = async (e) => {

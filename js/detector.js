@@ -2,6 +2,7 @@
 // runs a YOLO model on a region of the current frame and returns boxes in frame pixels.
 
 export const MODELS = {
+  'sheep-race': { file: 'models/sheep-race-1.onnx', kind: 'e2e1', size: 384, mb: 10, view: 'race' },
   'sheep-top': { file: 'models/sheep-top.onnx', kind: 'v8', size: 640, mb: 12, view: 'top' },
   'general-n': { file: 'models/general-n.onnx', kind: 'e2e', size: 640, mb: 10, view: 'side' },
   'general-s': { file: 'models/general-s.onnx', kind: 'e2e', size: 640, mb: 38, view: 'side' },
@@ -180,7 +181,11 @@ export class Detector {
     const tensor = out[this.session.outputNames[0]];
     const data = tensor.data;
     let raw;
-    if (this.info.kind === 'e2e') raw = decodeE2E(data, tensor.dims, conf);
+    // end-to-end heads need no NMS in theory, but a lightly trained model can still emit two
+    // near-identical boxes for one sheep (IoU ~0.8-0.9): a loose NMS removes them, side-by-side
+    // sheep overlap far less than that
+    if (this.info.kind === 'e2e') raw = nms(decodeE2E(data, tensor.dims, conf), 0.65);
+    else if (this.info.kind === 'e2e1') raw = nms(decodeE2E(data, tensor.dims, conf, true), 0.65);
     else raw = nms(decodeV8(data, tensor.dims, conf), 0.5);
     const boxes = [];
     for (const b of raw) {
@@ -202,17 +207,20 @@ export class Detector {
   }
 }
 
-// YOLO26 end-to-end head: [1, N, 6] = x1, y1, x2, y2, score, class (no NMS needed)
-function decodeE2E(data, dims, conf) {
+// YOLO26 end-to-end head: [1, N, 6] = x1, y1, x2, y2, score, class (no NMS needed).
+// singleClass: a model trained on sheep only (class 0), so every box is a sheep.
+function decodeE2E(data, dims, conf, singleClass = false) {
   const n = dims[1], k = dims[2];
   const res = [];
   for (let i = 0; i < n; i++) {
     const o = i * k;
     let s = data[o + 4];
     if (s < conf) continue;
-    const c = Math.round(data[o + 5]);
-    if (!COCO_ANIMALS.has(c)) continue;
-    if (c !== COCO_SHEEP) s *= 0.85;
+    if (!singleClass) {
+      const c = Math.round(data[o + 5]);
+      if (!COCO_ANIMALS.has(c)) continue;
+      if (c !== COCO_SHEEP) s *= 0.85;
+    }
     res.push([data[o], data[o + 1], data[o + 2], data[o + 3], s]);
   }
   return res;

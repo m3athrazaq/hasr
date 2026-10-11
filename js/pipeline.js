@@ -2,6 +2,7 @@
 // frame history used to build review clips for doubtful cases.
 import { Tracker, iou, center } from './engine/tracker.js';
 import { LineCounter } from './engine/counter.js';
+import { FlowLearner } from './engine/flow.js';
 import { nextFrame } from './sources.js';
 import { store } from './store.js';
 import { roundRect } from './overlay.js';
@@ -66,6 +67,7 @@ export class Pipeline {
     this.frames = 0;
     this.roi = null;
     this._seen = new Map();
+    this.flow = new FlowLearner();
   }
 
   setGeometry(line, dir, roi) {
@@ -97,9 +99,7 @@ export class Pipeline {
 
   _resetTracking() {
     this.tracker.reset();
-    this.counter.st.clear();
-    this.counter.births = [];
-    this.counter.deaths = [];
+    this.counter.restart();
     this.ring.clear();
   }
 
@@ -133,12 +133,14 @@ export class Pipeline {
       const meta = await nextFrame(v, 400);
       if (!this.running) break;
       const t = meta?.mediaTime ?? v.currentTime;
-      if (t + 1e-3 < next) continue;
+      // take the frame nearest the 12-per-second schedule (up to ~half a frame early), so a 30 fps
+      // video is sampled every 2-3 frames rather than every 3rd
+      if (t + 0.017 < next) continue;
       v.pause();
       const t0 = performance.now();
       try { await this._process(t); } catch (e) { console.error(e); }
       this.rate = step / Math.max(0.005, (performance.now() - t0) / 1000);
-      next = t + step;
+      next = Math.max(next + step, t + 0.5 * step);
     }
     if (this.running) {
       // flush anything still undecided at the end of the recording
@@ -160,9 +162,18 @@ export class Pipeline {
       this._resetTracking();
     }
     this.counter.setFrame(vw, vh);
+    if (this.line) {
+      // sheep standing still are expected to walk across the line (the counting direction, or the
+      // way they were actually seen walking if that differs): big backward jumps are other animals
+      const [fx, fy] = this.counter.forward();
+      const md = this.motionDirection();
+      const sgn = md && md !== this.dir ? -1 : 1;
+      this.tracker.setFlow(sgn * fx, sgn * fy);
+    } else this.tracker.setFlow(0, 0);
     const roiPx = this.roi ? { x: Math.round(this.roi.x * vw), y: Math.round(this.roi.y * vh), w: Math.round(this.roi.w * vw), h: Math.round(this.roi.h * vh) } : null;
     const { boxes, ms } = await this.detector.detect(this.video, vw, vh, roiPx, this.sens.conf);
     this.inferMs = this.inferMs ? 0.85 * this.inferMs + 0.15 * ms : ms;
+    if (self.__hasrDebug) self.__hasrDebug.push({ t, W: vw, H: vh, boxes: boxes.map((b) => ({ ...b })) }); // test hook
     const { tracks, events } = this.tracker.step(boxes, t);
     const evs = this.line ? this.counter.update(tracks, events, t) : [];
     this.ring.push(this.video, vw, vh, t, tracks.filter((x) => x.updated).map((x) => ({ id: x.id, b: x.box, s: x.state })));
@@ -176,7 +187,7 @@ export class Pipeline {
     this.lastT = t;
 
     if (this.session) this._handle(evs, t);
-    else this._learnDirection(tracks);
+    else { this._learnDirection(tracks); this.flow.add(tracks, vw, vh); }
     await this._drainClips(false);
     this._updateQuality(tracks, boxes);
 
@@ -312,6 +323,8 @@ export class Pipeline {
   }
 }
 
+// Learns which way the sheep walk and where, so the counting line can be drawn across the flow
+// automatically (perpendicular to the motion, through the middle of the path, as wide as the passage).
 // Compare models on one still frame: which one sees sheep in this camera angle? Only detections
 // near the counting line matter (that is where every head must be seen).
 export async function sheepEvidence(detector, source, roi, line) {

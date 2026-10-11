@@ -4,6 +4,7 @@ import { hungarian } from './hungarian.js';
 import { BoxKF, setNoise } from './kalman.js';
 
 const BIG = 1e6;
+const SURE_MARGIN = 0.2;
 
 export function iou(a, b) {
   const ix = Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1);
@@ -14,9 +15,17 @@ export function iou(a, b) {
   return u > 0 ? inter / u : 0;
 }
 export const area = (b) => Math.max(0, b.x2 - b.x1) * Math.max(0, b.y2 - b.y1);
+const inter = (a, b) => Math.max(0, Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1)) * Math.max(0, Math.min(a.y2, b.y2) - Math.max(a.y1, b.y1));
 export const center = (b) => [(b.x1 + b.x2) / 2, (b.y1 + b.y2) / 2];
 const diag = (b) => Math.hypot(b.x2 - b.x1, b.y2 - b.y1);
 const toZ = (b) => [(b.x1 + b.x2) / 2, (b.y1 + b.y2) / 2, b.x2 - b.x1, b.y2 - b.y1];
+
+// how far detection d lies behind box a along unit direction dir, in box diagonals (>0 = behind)
+function backwards(a, d, dir) {
+  const [ax, ay] = center(a);
+  const [dx, dy] = center(d);
+  return -((dx - ax) * dir[0] + (dy - ay) * dir[1]) / Math.max(1e-6, 0.5 * (diag(a) + diag(d)));
+}
 
 function normDist(a, b) {
   const [ax, ay] = center(a);
@@ -42,6 +51,16 @@ export const TRACKER_DEFAULTS = {
   sp: 1 / 20,           // Kalman position noise weight
   sv: 1 / 160,          // Kalman velocity noise weight
   mixCost: 0.0,         // weight of centre distance added to the IoU cost (helps at low fps)
+  maxBack: Infinity,    // optional: a non-overlapping match may not lie further than this (normalised) behind
+                        // the track's heading. Off by default: sheep that turn back at low frame rates need it off
+  movingSpeed: 0.15,    // normalised speed (box diagonals per second) above which a track has a heading
+  claimIou: 0.3,        // a detection overlapping another track this much belongs to that track
+  dupIou: 0.5,          // no new track from a detection overlapping a track updated this frame (duplicate box)
+  sureIou: 0.5,         // track/box pairs that are each other's best overlap above this are matched first
+  partIn: 0.8,          // no new track from a box lying this much inside a followed animal (a part of it)
+  claimWeak: 0.5,       // ... and an overlap below this does not take a box another track overlaps
+  claimRatio: 2,        //     at least this many times better
+  relinkBack: 0.35,     // a lost track is not re-linked to an animal this far (normalised) behind its heading
 };
 
 class Track {
@@ -59,6 +78,7 @@ class Track {
     this.maxScore = det.score;
     this.updated = true;
     this.hist = [{ t, cx: (det.x1 + det.x2) / 2, cy: (det.y1 + det.y2) / 2, a: area(det), s: det.score, g: det.gid }];
+    this.split = 0; // frames in which two separate animals were seen inside this track's box
   }
 
   measure(det, t, histLen) {
@@ -92,16 +112,38 @@ class Track {
   }
 }
 
-function associate(tracks, dets, costFn) {
+function associate(tracks, dets, costFn, sureIou = 0) {
   if (!tracks.length || !dets.length) return { matches: [], ut: tracks.slice(), ud: dets.slice() };
-  const C = tracks.map((tr) => dets.map((d) => costFn(tr, d)));
-  const pairs = hungarian(C);
   const matches = [];
   const mt = new Set(), md = new Set();
-  for (const [i, j] of pairs) {
-    if (C[i][j] >= BIG) continue;
-    matches.push([tracks[i], dets[j]]);
-    mt.add(i); md.add(j);
+  if (sureIou > 0) {
+    // unambiguous pairs first: a track and a box that are each other's best overlap. Otherwise the
+    // global optimum may hand a sheep's box to a neighbour whose own box is weak this frame, and
+    // leave the sheep a fragment (head, half body) of itself.
+    // (with a clear margin over every alternative, so only really unambiguous pairs are fixed)
+    const V = tracks.map((tr) => dets.map((d) => iou(tr.pred, d)));
+    for (let i = 0; i < tracks.length; i++) {
+      let bj = -1, second = 0;
+      for (let j = 0; j < dets.length; j++) {
+        if (bj < 0 || V[i][j] > V[i][bj]) { if (bj >= 0) second = Math.max(second, V[i][bj]); bj = j; } else second = Math.max(second, V[i][j]);
+      }
+      if (bj < 0 || V[i][bj] < sureIou || V[i][bj] - second < SURE_MARGIN) continue;
+      let ok = true;
+      for (let k = 0; k < tracks.length; k++) if (k !== i && V[k][bj] > V[i][bj] - SURE_MARGIN) { ok = false; break; }
+      if (!ok || md.has(bj) || costFn(tracks[i], dets[bj]) >= BIG) continue;
+      matches.push([tracks[i], dets[bj]]);
+      mt.add(i); md.add(bj);
+    }
+  }
+  const ri = tracks.map((_, i) => i).filter((i) => !mt.has(i));
+  const rj = dets.map((_, j) => j).filter((j) => !md.has(j));
+  if (ri.length && rj.length) {
+    const C = ri.map((i) => rj.map((j) => costFn(tracks[i], dets[j])));
+    for (const [a, b] of hungarian(C)) {
+      if (C[a][b] >= BIG) continue;
+      matches.push([tracks[ri[a]], dets[rj[b]]]);
+      mt.add(ri[a]); md.add(rj[b]);
+    }
   }
   return {
     matches,
@@ -117,6 +159,13 @@ export class Tracker {
     this.tracks = [];
     this.nextId = 1;
     this.t = null;
+    this.flow = null; // expected walking direction (unit vector, px), e.g. across the counting line
+  }
+
+  // hint for tracks that are standing still: which way the animals are expected to walk
+  setFlow(fx, fy) {
+    const n = Math.hypot(fx, fy);
+    this.flow = n > 1e-6 ? [fx / n, fy / n] : null;
   }
 
   reset() {
@@ -144,17 +193,38 @@ export class Tracker {
     const active = this.tracks.filter((tr) => tr.state !== 'tentative');
     const tent = this.tracks.filter((tr) => tr.state === 'tentative');
 
+    // a detection that clearly overlaps another track's prediction belongs to that track: a sheep whose
+    // own box is weak this frame must not take its neighbour's box on a small overlap or by distance
+    const bestOf = new Map();
+    for (const d of high) {
+      let bt = null, bv = 0;
+      for (const tr of this.tracks) { const v = iou(tr.pred, d); if (v > bv) { bv = v; bt = tr; } }
+      bestOf.set(d, { tr: bt, v: bv });
+    }
+    const claimedByOther = (d, tr, v = 0) => {
+      const b = bestOf.get(d);
+      return !!b && b.tr !== tr && b.v >= o.claimIou && b.v >= o.claimRatio * v + 0.05;
+    };
+
     // Stage 1: confirmed + lost tracks vs confident detections (IoU, then distance for fast motion)
     const s1 = associate(active, high, (tr, d) => {
       const v = iou(tr.pred, d);
-      if (v >= o.matchIou) return 1 - v + (o.mixCost ? o.mixCost * normDist(tr.pred, d) : 0);
+      if (v >= o.matchIou) {
+        if (v < o.claimWeak && claimedByOther(d, tr, v)) return BIG;
+        return 1 - v + (o.mixCost ? o.mixCost * normDist(tr.pred, d) : 0);
+      }
       const ar = area(d) / Math.max(1, area(tr.pred));
       if (ar < 0.4 || ar > 2.5) return BIG;
+      if (claimedByOther(d, tr)) return BIG;
       const tsu = t - tr.lastSeen;
-      const gate = o.distGate * (1 + Math.min(1, tsu / 0.6));
+      const head = this._heading(tr);
+      // the gate widens while a moving track is unseen; a track standing still keeps a tight gate
+      const gate = o.distGate * (1 + (head.moving ? Math.min(1, tsu / 0.6) : 0));
       const dn = normDist(tr.pred, d);
-      return dn < gate ? 1 + dn : BIG;
-    });
+      if (dn >= gate) return BIG;
+      if (head.dir && backwards(tr.box, d, head.dir) > o.maxBack) return BIG;
+      return 1 + dn;
+    }, o.sureIou);
     for (const [tr, d] of s1.matches) this._apply(tr, d, t, events);
 
     // Stage 2: still-tracked (not lost) tracks vs low-score detections
@@ -168,15 +238,18 @@ export class Tracker {
     // Stage 3: tentative tracks vs remaining confident detections
     const s3 = associate(tent, s1.ud, (tr, d) => {
       const v = iou(tr.pred, d);
-      if (v >= o.tentativeIou) return 1 - v;
+      if (v >= o.tentativeIou) return v < o.claimWeak && claimedByOther(d, tr, v) ? BIG : 1 - v;
       const ar = area(d) / Math.max(1, area(tr.pred));
       if (ar < 0.5 || ar > 2) return BIG;
+      if (claimedByOther(d, tr)) return BIG;
       // unconfirmed tracks have no reliable velocity yet: allow a move proportional to the time unseen
       const tsu = t - tr.lastSeen;
       const dn = normDist(tr.pred, d);
       const gate = 0.35 + 0.9 * Math.min(1, tsu / 0.4);
-      return dn < gate ? 1 + dn : BIG;
-    });
+      if (dn >= gate) return BIG;
+      if (this.flow && backwards(tr.box, d, this.flow) > o.maxBack) return BIG;
+      return 1 + dn;
+    }, o.sureIou);
     for (const [tr, d] of s3.matches) this._apply(tr, d, t, events);
 
     // Unmatched tentative tracks survive a short gap (weak detectors miss frames); confirmed become lost
@@ -195,9 +268,21 @@ export class Tracker {
     }
     this.tracks = this.tracks.filter((tr) => !dead.has(tr));
 
-    // New tracks from confident unmatched detections
+    // New tracks from confident unmatched detections - but not from a second box on an animal already
+    // followed in this frame, a box on part of it (head, front half), or a box around two of them
+    const seen = this.tracks.filter((tr) => tr.updated);
+    const redundant = (d) => {
+      let around = 0;
+      for (const tr of seen) {
+        if (iou(tr.box, d) >= o.dupIou) return true;
+        const i = inter(tr.box, d);
+        if (i >= o.partIn * area(d) && area(d) <= 0.7 * area(tr.box)) return true;
+        if (i >= o.partIn * 0.875 * area(tr.box)) around++;
+      }
+      return around >= 2;
+    };
     for (const d of s3.ud) {
-      if (d.score < o.newThr) continue;
+      if (d.score < o.newThr || redundant(d)) continue;
       this.tracks.push(new Track(this.nextId++, d, t, o.fps));
     }
 
@@ -213,6 +298,7 @@ export class Tracker {
         cand.score = tr.score;
         cand.maxScore = Math.max(cand.maxScore, tr.maxScore);
         cand.hits += tr.hits;
+        cand.split += tr.split;
         cand.lastSeen = t;
         cand.updated = true;
         cand.state = 'confirmed';
@@ -225,6 +311,20 @@ export class Tracker {
         events.push({ type: 'confirmed', id: tr.id, t });
       }
     }
+    // evidence that a box holds two animals: two separate smaller boxes inside it (side by side or
+    // one behind the other). Used by the counter to ask for a review of such crossings.
+    for (const tr of this.tracks) {
+      if (!tr.updated || tr.state !== 'confirmed') continue;
+      const A = area(tr.box);
+      const sub = valid.filter((d) => area(d) <= 0.75 * A && inter(d, tr.box) >= 0.7 * area(d));
+      let two = false;
+      for (let i = 0; i < sub.length && !two; i++) {
+        for (let j = i + 1; j < sub.length; j++) {
+          if (iou(sub[i], sub[j]) < 0.2 && area(sub[i]) + area(sub[j]) >= 0.5 * A) { two = true; break; }
+        }
+      }
+      if (two) tr.split++;
+    }
     return { tracks: this.tracks, events };
   }
 
@@ -236,6 +336,14 @@ export class Tracker {
       tr.state = 'confirmed';
       events.push({ type: 'recovered', id: tr.id, gap, t });
     }
+  }
+
+  // direction a track is heading: its own motion when it moves, else the expected flow (if known)
+  _heading(tr) {
+    const [vx, vy] = tr.velocity();
+    const sp = Math.hypot(vx, vy);
+    if (sp > 1e-6 && sp / Math.max(1, diag(tr.box)) > this.o.movingSpeed) return { dir: [vx / sp, vy / sp], moving: true };
+    return { dir: this.flow, moving: false };
   }
 
   _relinkCandidate(tr, t) {
@@ -264,7 +372,11 @@ export class Tracker {
       if (sp > 1e-3) {
         const along = ((nx - lx) * vx + (ny - ly) * vy) / sp / size;
         if (along < -0.15) back = -along;
+      } else if (this.flow) {
+        const along = ((nx - lx) * this.flow[0] + (ny - ly) * this.flow[1]) / size;
+        if (along < -0.15) back = -along;
       }
+      if (back > o.relinkBack) continue; // a lost sheep does not reappear behind where it was going
       const cost = dn + 0.6 * gap / o.relinkGap + 1.5 * back;
       if (cost < bestD) { best = c; bestD = cost; }
     }

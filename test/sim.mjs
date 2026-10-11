@@ -130,6 +130,7 @@ export function runEngine(sim, trackerOpts = {}, counterOpts = {}) {
   const counter = new LineCounter(counterOpts);
   counter.setFrame(sim.W, sim.H);
   counter.setLine({ x1: sim.LINE_X / sim.W, y1: 0.02, x2: sim.LINE_X / sim.W, y2: 0.98 }, 1);
+  if (trackerOpts.flowHint) tracker.setFlow(...counter.forward());
   const events = [];
   let lastT = 0;
   for (const f of sim.frames) {
@@ -155,7 +156,7 @@ export function runEngine(sim, trackerOpts = {}, counterOpts = {}) {
   return { auto, allAccepted, flags, nCross: crosses.length, fwd: counter.fwd, back: counter.back };
 }
 
-const SCEN = {
+export const SCEN = {
   sparse:   { duration: 120, rate: 1.0, lanes: 1, yJitter: 15, speed: 260, pStop: 0.004, pBack: 0.004, pDet: 0.93, pDetOccl: 0.7, boxNoise: 4, mergeIou: 0.35, pMerge: 0.02, pFalse: 0.01, fps: 12, sizeVar: 1 },
   medium:   { duration: 120, rate: 3.0, lanes: 2, yJitter: 30, speed: 240, pStop: 0.006, pBack: 0.006, pDet: 0.9, pDetOccl: 0.6, boxNoise: 5, mergeIou: 0.3, pMerge: 0.03, pFalse: 0.02, fps: 12, sizeVar: 1 },
   dense:    { duration: 120, rate: 6.0, lanes: 4, yJitter: 40, speed: 220, pStop: 0.008, pBack: 0.008, pDet: 0.88, pDetOccl: 0.55, boxNoise: 6, mergeIou: 0.3, pMerge: 0.05, pFalse: 0.03, fps: 12, sizeVar: 1 },

@@ -115,6 +115,7 @@
         <div class="tools">
           <button class="chip" id="btnFlip" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h11l-3-3M17 17H6l3 3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><span data-i18n="flip"></span></button>
           <button class="chip" id="btnToolLine" type="button" aria-pressed="true"><span data-i18n="redraw"></span></button>
+          <button class="chip" id="btnAutoLine" type="button"><span data-i18n="autoLine"></span></button>
           <button class="chip" id="btnToolRoi" type="button" aria-pressed="false"><span data-i18n="roi"></span></button>
           <button class="chip" id="btnRoiClear" type="button" hidden><span data-i18n="roiClear"></span></button>
         </div>
@@ -124,6 +125,7 @@
           <label class="mini-field"><span data-i18n="view"></span>
             <select id="selView">
               <option value="auto" data-i18n="viewAuto"></option>
+              <option value="sheep-race" data-i18n="viewRace"></option>
               <option value="sheep-top" data-i18n="viewTop"></option>
               <option value="general-n" data-i18n="viewSide"></option>
               <option value="general-s" data-i18n="viewSideHq"></option>
@@ -212,7 +214,7 @@
       <label class="field"><span data-i18n="language"></span>
         <select id="sLang"><option value="ar">العربية</option><option value="en">English</option></select></label>
       <label class="field"><span data-i18n="view"></span>
-        <select id="sView"><option value="auto" data-i18n="viewAuto"></option><option value="sheep-top" data-i18n="viewTop"></option><option value="general-n" data-i18n="viewSide"></option><option value="general-s" data-i18n="viewSideHq"></option></select></label>
+        <select id="sView"><option value="auto" data-i18n="viewAuto"></option><option value="sheep-race" data-i18n="viewRace"></option><option value="sheep-top" data-i18n="viewTop"></option><option value="general-n" data-i18n="viewSide"></option><option value="general-s" data-i18n="viewSideHq"></option></select></label>
       <label class="field"><span data-i18n="backend"></span>
         <select id="sBackend"><option value="auto" data-i18n="beAuto"></option><option value="webgpu" data-i18n="beGpu"></option><option value="wasm" data-i18n="beCpu"></option></select></label>
       <label class="field"><span data-i18n="sensitivity"></span>
