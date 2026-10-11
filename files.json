@@ -1,0 +1,16 @@
+{
+ "models/general-s.onnx": {
+  "size": 38291270,
+  "parts": [
+   "models/general-s.onnx.part0",
+   "models/general-s.onnx.part1"
+  ]
+ },
+ "vendor/ort/ort-wasm-simd-threaded.asyncify.wasm": {
+  "size": 26781914,
+  "parts": [
+   "vendor/ort/ort-wasm-simd-threaded.asyncify.wasm.part0",
+   "vendor/ort/ort-wasm-simd-threaded.asyncify.wasm.part1"
+  ]
+ }
+}
