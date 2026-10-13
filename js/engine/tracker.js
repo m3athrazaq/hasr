@@ -61,6 +61,7 @@ export const TRACKER_DEFAULTS = {
   claimWeak: 0.5,       // ... and an overlap below this does not take a box another track overlaps
   claimRatio: 2,        //     at least this many times better
   relinkBack: 0.35,     // a lost track is not re-linked to an animal this far (normalised) behind its heading
+  tentBack: 0.5,        // an unconfirmed track does not jump this far (normalised) against the walking direction
 };
 
 class Track {
@@ -247,7 +248,9 @@ export class Tracker {
       const dn = normDist(tr.pred, d);
       const gate = 0.35 + 0.9 * Math.min(1, tsu / 0.4);
       if (dn >= gate) return BIG;
-      if (this.flow && backwards(tr.box, d, this.flow) > o.maxBack) return BIG;
+      // an unconfirmed track has no motion of its own yet: a big jump against the expected walking
+      // direction is another animal (or a box on a different part of the crowd)
+      if (this.flow && backwards(tr.box, d, this.flow) > Math.min(o.maxBack, o.tentBack)) return BIG;
       return 1 + dn;
     }, o.sureIou);
     for (const [tr, d] of s3.matches) this._apply(tr, d, t, events);

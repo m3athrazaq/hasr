@@ -2,7 +2,7 @@
 // runs a YOLO model on a region of the current frame and returns boxes in frame pixels.
 
 export const MODELS = {
-  'sheep-race': { file: 'models/sheep-race-1.onnx', kind: 'e2e1', size: 384, mb: 10, view: 'race' },
+  'sheep-race': { file: 'models/sheep-race-2.onnx', kind: 'e2e1', size: 480, mb: 10, view: 'race', norm: true },
   'sheep-top': { file: 'models/sheep-top.onnx', kind: 'v8', size: 640, mb: 12, view: 'top' },
   'general-n': { file: 'models/general-n.onnx', kind: 'e2e', size: 640, mb: 10, view: 'side' },
   'general-s': { file: 'models/general-s.onnx', kind: 'e2e', size: 640, mb: 38, view: 'side' },
@@ -175,6 +175,17 @@ export class Detector {
       inp[i + plane] = pix[j + 1] / 255;
       inp[i + 2 * plane] = pix[j + 2] / 255;
     }
+    const lut = this.info.norm ? brightenLut(pix, S, px, py, nw, nh, this) : null;
+    if (lut) {
+      // night footage: brighten the picture (not the grey padding) the same way as the reference tools
+      for (let y = py; y < py + nh; y++) {
+        for (let x = px, i = y * S + px, j = i * 4; x < px + nw; x++, i++, j += 4) {
+          inp[i] = lut[pix[j]];
+          inp[i + plane] = lut[pix[j + 1]];
+          inp[i + 2 * plane] = lut[pix[j + 2]];
+        }
+      }
+    }
     const t0 = performance.now();
     const out = await this.session.run({ [this.inputName]: new this.ort.Tensor('float32', inp, [1, 3, S, S]) });
     const ms = performance.now() - t0;
@@ -205,6 +216,23 @@ export class Detector {
   release() {
     try { this.session?.release?.(); } catch { /* ignore */ }
   }
+}
+
+// Dark (night) pictures are brightened towards a mean level of NORM_TARGET with a gamma curve:
+// sheep standing in a dim race are then found as well as sheep under the lamps. Returns null when the
+// picture is bright enough. Must match brighten_lut() in tools/refdet.py.
+const NORM_TARGET = 85;
+function brightenLut(pix, S, px, py, nw, nh, holder) {
+  let sum = 0, n = 0;
+  for (let y = py; y < py + nh; y += 4) {
+    for (let x = px; x < px + nw; x += 4) { const j = (y * S + x) * 4; sum += pix[j] + pix[j + 1] + pix[j + 2]; n += 3; }
+  }
+  const m = Math.min(254, Math.max(1, sum / Math.max(1, n)));
+  if (m >= NORM_TARGET) return null;
+  const g = Math.max(0.4, Math.log(NORM_TARGET / 255) / Math.log(m / 255));
+  const lut = holder._lut || (holder._lut = new Float32Array(256));
+  for (let i = 0; i < 256; i++) lut[i] = Math.round(255 * Math.pow(i / 255, g)) / 255;
+  return lut;
 }
 
 // YOLO26 end-to-end head: [1, N, 6] = x1, y1, x2, y2, score, class (no NMS needed).

@@ -11,7 +11,7 @@ import { Session } from './session.js';
 import { summarize, toCSV, toJSON, textSummary, batchTime, fileName } from './report.js';
 import { renderGuide } from './guide.js';
 
-export const VERSION = '1.0.3';
+export const VERSION = '1.0.4';
 const $ = (id) => document.getElementById(id);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const settings = loadSettings();
@@ -269,10 +269,12 @@ async function autoLineFromFile() {
   const flow = new FlowLearner();
   const dur = src.duration || 0;
   modelState(t('autoLineLooking'));
-  for (const start of [0.15, 0.45, 0.7]) {
+  // several short looks spread over the recording; stop once enough sheep were seen crossing one spot
+  let sug = null, looks = 0;
+  for (const start of [0.12, 0.35, 0.58, 0.8, 0.95]) {
     tracker.reset();
-    const t0 = Math.max(0, Math.min(dur - 4.5, dur * start));
-    for (let i = 0; i < 32; i++) {
+    const t0 = Math.max(0, Math.min(dur - 5.5, dur * start));
+    for (let i = 0; i < 40; i++) {
       const tt = t0 + i / 8;
       if (tt >= dur || S.source !== src || S.lineByUser) break;
       await seek(v, tt);
@@ -280,9 +282,12 @@ async function autoLineFromFile() {
       const { tracks } = tracker.step(r.boxes, tt);
       flow.add(tracks, vw, vh);
     }
-    const sug = flow.suggest();
-    if (sug) { applyAutoLine(sug); break; }
+    if (S.source !== src || S.lineByUser) break;
+    sug = flow.suggest() || sug;
+    // at least three looks: a single stretch of the recording can show the sheep milling in the pen
+    if (++looks >= 3 && sug && sug.n >= 8) break;
   }
+  if (sug && S.source === src && !S.lineByUser) applyAutoLine(sug);
   if (!S.autoLined && S.source === src) modelState(t('autoLineFailed'), 'bad');
   else if (S.source === src) modelState(`${t('modelReady')}: ${modelName(S.modelKey)}`, 'ok');
   await seek(v, Math.min(5, dur * 0.1));

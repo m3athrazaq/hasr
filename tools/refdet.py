@@ -18,9 +18,20 @@ def nms(cand, thr):
         if len(keep) >= 300: break
     return keep
 
+NORM_TARGET = 85.0
+
+def brighten_lut(mean):
+    m = min(254.0, max(1.0, float(mean)))
+    g = 1.0 if m >= NORM_TARGET else max(0.4, np.log(NORM_TARGET / 255.0) / np.log(m / 255.0))
+    return np.array([round(255.0 * (i / 255.0) ** g) for i in range(256)], np.uint8)
+
 class Det:
-    def __init__(self, path, kind):
-        self.s = ort.InferenceSession(path, providers=['CPUExecutionProvider'])
+    def __init__(self, path, kind, norm=None):
+        import os
+        self.norm = (os.environ.get('HASR_NORM') == '1') if norm is None else norm
+        so = ort.SessionOptions()
+        if os.environ.get('HASR_THREADS'): so.intra_op_num_threads = int(os.environ['HASR_THREADS'])
+        self.s = ort.InferenceSession(path, so, providers=['CPUExecutionProvider'])
         self.inp = self.s.get_inputs()[0].name
         self.size = self.s.get_inputs()[0].shape[2]
         self.kind = kind  # 'e2e' (YOLO26 COCO), 'e2e1' (single-class YOLO26) or 'v8' (single-class sheep head)
@@ -36,6 +47,9 @@ class Det:
         px, py = (S - nw) // 2, (S - nh) // 2
         canvas = np.full((S, S, 3), 114, np.uint8)
         canvas[py:py + nh, px:px + nw] = cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        if self.norm:
+            # same as the browser: brighten dark (night) pictures towards a mean level of NORM_TARGET
+            canvas[py:py + nh, px:px + nw] = cv2.LUT(canvas[py:py + nh, px:px + nw], brighten_lut(canvas[py:py + nh, px:px + nw][::4, ::4].mean()))
         x = canvas[:, :, ::-1].transpose(2, 0, 1)[None].astype(np.float32) / 255.0
         out = self.s.run(None, {self.inp: x})[0][0]
         boxes = []

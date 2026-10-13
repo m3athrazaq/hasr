@@ -1,6 +1,6 @@
 // Hasr service worker: offline app shell, cached AI models/runtime, and the cross-origin
 // isolation headers (COOP/COEP) that GitHub Pages cannot send, so the AI engine can use all CPU cores.
-const VERSION = 'hasr-1.0.3';
+const VERSION = 'hasr-1.0.4';
 const SHELL_CACHE = 'hasr-shell-' + VERSION;
 const ASSET_CACHE = 'hasr-assets-v1'; // models and runtime: large, versioned by file name
 const SHELL = [

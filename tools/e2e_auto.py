@@ -21,7 +21,7 @@ async def main():
         print('home ready', flush=True)
         await pg.click('#btnFile')
         await pg.fill('#fVessel', 'تجربة')
-        await pg.fill('#fVoyage', 'WA0031')
+        await pg.fill('#fVoyage', 'TEST')
         async with pg.expect_file_chooser() as fc:
             await pg.click('#newForm button[type=submit]')
         chooser = await fc.value

@@ -16,6 +16,9 @@ export const COUNTER_DEFAULTS = {
   minSizeSamples: 20,
   warmup: 1.0,         // seconds after a (re)start in which animals already past the line are not "appearing"
   birthSide: 0.15,     // a track first seen this far into the dead band (fraction of it) starts on that side
+  inheritBand: 1.5,    // a track first seen within this many dead bands of the line, where a not yet counted
+  inheritDist: 0.6,    //   track was lost (within this many sheep lengths, at most inheritGap seconds ago),
+  inheritGap: 3.0,     //   continues that sheep: it still has to cross
 };
 
 const median = (arr) => {
@@ -105,7 +108,7 @@ export class LineCounter {
         if (!s) continue;
         if (Math.abs(s.lastD) < near && this.inSeg(s.lastS)) {
           this.deaths.push({ id: ev.id, t: ev.lastSeen, side: s.lastD < 0 ? -1 : 1, d: s.lastD, s: s.lastS,
-            box: ev.box, vel: ev.vel, crossed: s.crossed, decideAt: t + this.o.orphanWindow });
+            box: ev.box, vel: ev.vel, crossed: s.crossed, stSide: s.side, decideAt: t + this.o.orphanWindow });
         }
       }
     }
@@ -121,12 +124,21 @@ export class LineCounter {
         const h0 = tr.hist[0];
         const g0 = h0 ? this.locate(h0.cx, h0.cy) : { d, s };
         st = { side: 0, born: h0 ? h0.t : t, bornD: g0.d, bornS: g0.s, crossed: 0, lastD: g0.d, lastS: g0.s, lastZone: 0, relinkGap: 0, maxScore: 0 };
-        // first seen inside the dead band but clearly on one side: start from that side, so a sheep
-        // that first shows up just before the line and walks over it is still counted - unless it may
-        // be an already counted sheep picked up again (a counted track was lost right there)
-        if (Math.abs(g0.d) >= this.o.birthSide * this.bandPx() && this.inSeg(g0.s) && !this._recounted(tr, h0, tracks, t)) st.side = g0.d < 0 ? -1 : 1;
+        // a sheep standing on the line is often lost and picked up again under a new id: if this track
+        // starts right where a not yet counted one was lost, it is that sheep - it is still on the
+        // source side and must be counted once it walks over
+        const heir = Math.abs(g0.d) <= this.o.inheritBand * this.bandPx() && this.inSeg(g0.s) ? this._uncountedLost(tr, h0, tracks, t) : null;
+        if (heir) {
+          st.side = -1;
+          if (heir.death) this.deaths = this.deaths.filter((x) => x !== heir.death);
+        } else if (Math.abs(g0.d) >= this.o.birthSide * this.bandPx() && this.inSeg(g0.s) && !this._recounted(tr, h0, tracks, t)) {
+          // first seen inside the dead band but clearly on one side: start from that side, so a sheep
+          // that first shows up just before the line and walks over it is still counted - unless it
+          // may be an already counted sheep picked up again (a counted track was lost right there)
+          st.side = g0.d < 0 ? -1 : 1;
+        }
         this.st.set(tr.id, st);
-        if (Math.abs(g0.d) < near && this.inSeg(g0.s) && st.born - this.startT >= this.o.warmup) {
+        if (!heir && Math.abs(g0.d) < near && this.inSeg(g0.s) && st.born - this.startT >= this.o.warmup) {
           this.births.push({ id: tr.id, t: st.born, side: g0.d < 0 ? -1 : 1, d: g0.d, s: g0.s, box: tr.box, decideAt: t + this.o.orphanWindow });
         }
         for (let i = 0; i < tr.hist.length - 1; i++) {
@@ -164,6 +176,29 @@ export class LineCounter {
 
     out.push(...this._resolveOrphans(t));
     return out;
+  }
+
+  // the nearest track lost (or given up) in the last few seconds right where this one starts, that was
+  // still on the source side and not counted
+  _uncountedLost(tr, h0, tracks, t) {
+    if (!h0) return null;
+    const len = this.sheepLen() || 0.12 * Math.min(this.W, this.H);
+    let best = null, bestD = this.o.inheritDist * len;
+    for (const o of tracks) {
+      if (o === tr || o.state !== 'lost' || t - o.lastSeen > this.o.inheritGap) continue;
+      const so = this.st.get(o.id);
+      if (!so || so.side !== -1 || so.crossed > 0) continue;
+      const [x, y] = center(o.box);
+      const dd = Math.hypot(h0.cx - x, h0.cy - y);
+      if (dd < bestD) { bestD = dd; best = { id: o.id }; }
+    }
+    for (const dth of this.deaths) {
+      if (dth.stSide !== -1 || dth.crossed > 0 || t - dth.t > this.o.inheritGap) continue;
+      const [x, y] = center(dth.box);
+      const dd = Math.hypot(h0.cx - x, h0.cy - y);
+      if (dd < bestD) { bestD = dd; best = { id: dth.id, death: dth }; }
+    }
+    return best;
   }
 
   _recounted(tr, h0, tracks, t) {
